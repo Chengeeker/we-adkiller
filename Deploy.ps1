@@ -16,6 +16,18 @@ $primaryPatchOffsets = [int64[]](0x5619AEA, 0x561A41A)
 $pagePatchOffset = [int64]0x3C079DA
 $allPatchOffsets = [int64[]]($primaryPatchOffsets + $pagePatchOffset)
 
+function Get-Sha256([string]$Path) {
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToUpperInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Read-State {
     if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
         return $null
@@ -78,7 +90,7 @@ function Test-OriginalBackup([string]$Path) {
         return $false
     }
     try {
-        return ((Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToUpperInvariant() -eq $originalHash)
+        return ((Get-Sha256 $Path) -eq $originalHash)
     }
     catch {
         return $false
@@ -128,7 +140,7 @@ try {
 
     $state = Read-State
     $targetDll = Resolve-Dll $DllPath $state
-    $currentHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $targetDll).Hash.ToUpperInvariant()
+    $currentHash = Get-Sha256 $targetDll
     $originalBackup = $null
     $previousBackup = $null
 

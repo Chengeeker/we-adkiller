@@ -12,6 +12,18 @@ $patchScript = Join-Path $PSScriptRoot 'tools\PatchAds.ps1'
 $originalHash = '8F7406A8A465E851EE10EAECCCB572D0E5B4E00D480C770938C714C396097B74'
 $primaryPatchedHash = 'E83A63EB167F77BC2A3EDF8F5E0E7669DDFA0603240F0740F04BB27BD48E7789'
 $extendedPatchedHash = '0DD1EAC8610D2A9CF8A14E1F892A806E38A6F008731F056C33AA8147F527E2CC'
+
+function Get-Sha256([string]$Path) {
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToUpperInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
 $originalBytes = [byte[]](0x85, 0xF6, 0x0F, 0x95, 0xC0)
 $primaryPatchOffsets = [int64[]](0x5619AEA, 0x561A41A)
 $pagePatchOffset = [int64]0x3C079DA
@@ -57,7 +69,7 @@ function Test-OriginalBackup([string]$Path) {
         return $false
     }
     try {
-        return ((Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToUpperInvariant() -eq $originalHash)
+        return ((Get-Sha256 $Path) -eq $originalHash)
     }
     catch {
         return $false
@@ -137,7 +149,7 @@ try {
     }
     $state = Read-State
     $targetDll = Resolve-Dll $DllPath $state
-    $currentHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $targetDll).Hash.ToUpperInvariant()
+    $currentHash = Get-Sha256 $targetDll
     if ($currentHash -eq $originalHash) {
         Write-Host '当前文件已经是原版，无需恢复。'
         return

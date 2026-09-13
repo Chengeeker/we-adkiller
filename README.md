@@ -36,6 +36,8 @@
 - 目标架构：Windows x64
 - 其他版本默认拒绝修改，避免把旧偏移误用于新文件。
 
+脚本不依赖 `Get-FileHash`。如果系统 PowerShell 报“无法将 Get-FileHash 项识别为 cmdlet”，请重新下载最新版；当前脚本使用系统自带的 .NET SHA-256 实现，兼容旧版 Windows PowerShell。
+
 当前实验补丁位置：
 
 | 用途 | 文件偏移 | 原始字节 | 修改后字节 |

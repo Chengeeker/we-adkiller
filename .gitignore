@@ -1,0 +1,8 @@
+backups/
+.local/
+dist/
+*.exe
+*.pdb
+*.obj
+*.user
+.vs/

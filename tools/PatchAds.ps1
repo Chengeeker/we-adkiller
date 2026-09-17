@@ -4,31 +4,17 @@ param(
     [string]$Mode = 'Plan',
     [Parameter(Mandatory = $true)]
     [string]$DllPath,
-    [string]$BackupPath
+    [string]$BackupPath,
+    [string]$ExpectedOriginalHash
 )
 
 $ErrorActionPreference = 'Stop'
 
-$originalHash = '8F7406A8A465E851EE10EAECCCB572D0E5B4E00D480C770938C714C396097B74'
-$primaryPatchedHash = 'E83A63EB167F77BC2A3EDF8F5E0E7669DDFA0603240F0740F04BB27BD48E7789'
-$extendedPatchedHash = '0DD1EAC8610D2A9CF8A14E1F892A806E38A6F008731F056C33AA8147F527E2CC'
-$originalBytes = [byte[]](0x85, 0xF6, 0x0F, 0x95, 0xC0)
-$patchedBytes = [byte[]](0x31, 0xC0, 0x90, 0x90, 0x90)
-$primaryPatchOffsets = [int64[]](0x5619AEA, 0x561A41A)
-$pagePatchOffset = [int64]0x3C079DA
-$allPatchOffsets = [int64[]]($primaryPatchOffsets + $pagePatchOffset)
-
-function Get-Sha256([string]$Path) {
-    $stream = [System.IO.File]::OpenRead($Path)
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToUpperInvariant()
-    }
-    finally {
-        $sha256.Dispose()
-        $stream.Dispose()
-    }
+$profileScript = Join-Path $PSScriptRoot 'PatchProfile.ps1'
+if (-not (Test-Path -LiteralPath $profileScript -PathType Leaf)) {
+    throw "找不到定位模块: $profileScript"
 }
+. $profileScript
 
 function Get-TargetRoot([string]$Path) {
     $versionDirectory = [System.IO.Path]::GetDirectoryName($Path)
@@ -73,66 +59,35 @@ function Assert-TargetStopped([string]$Path) {
     }
 }
 
-function Read-BytesAt([string]$Path, [int64]$Offset) {
-    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-    try {
-        [void]$stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
-        $result = New-Object byte[] $originalBytes.Length
-        $read = $stream.Read($result, 0, $result.Length)
-        if ($read -ne $result.Length) {
-            throw "无法读取补丁位置 0x$('{0:X}' -f $Offset)。"
-        }
-        return $result
-    }
-    finally {
-        $stream.Dispose()
-    }
-}
-
-function Write-BytesAt([string]$Path, [int64]$Offset, [byte[]]$Bytes) {
-    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
-    try {
-        [void]$stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
-        $stream.Write($Bytes, 0, $Bytes.Length)
-        $stream.Flush()
-    }
-    finally {
-        $stream.Dispose()
-    }
-}
-
-function Test-BytesEqual([byte[]]$Left, [byte[]]$Right) {
-    if ($Left.Length -ne $Right.Length) {
-        return $false
-    }
-    for ($i = 0; $i -lt $Left.Length; $i++) {
-        if ($Left[$i] -ne $Right[$i]) {
-            return $false
-        }
-    }
-    return $true
-}
-
 if (-not (Test-Path -LiteralPath $DllPath -PathType Leaf)) {
     throw "找不到 DLL: $DllPath"
 }
 $DllPath = (Resolve-Path -LiteralPath $DllPath).Path
 
-$currentHash = Get-Sha256 $DllPath
+$profile = Get-PatchProfile $DllPath $ExpectedOriginalHash
+$currentHash = $profile.CurrentHash
+$originalBytes = $script:OriginalPatchBytes
+$patchedBytes = $script:PatchedPatchBytes
+$primaryPatchOffsets = $profile.PrimaryPatchOffsets
+$pagePatchOffset = $profile.PagePatchOffset
+$allPatchOffsets = $profile.AllPatchOffsets
 $states = @()
 foreach ($offset in $allPatchOffsets) {
     $bytes = Read-BytesAt $DllPath $offset
-    $states += (($bytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')
+    $states += (Convert-ToHex $bytes)
 }
 
 Write-Output "DLL: $DllPath"
 Write-Output "SHA256: $currentHash"
+Write-Output "Profile: $($profile.Name)"
+Write-Output "Confidence: $($profile.Confidence)"
+Write-Output "State: $($profile.CurrentState)"
 Write-Output ("Patch offsets: " + (($allPatchOffsets | ForEach-Object { '0x{0:X}' -f $_ }) -join ', '))
 Write-Output ("Current bytes: " + ($states -join ' | '))
 
 if ($Mode -eq 'Plan') {
-    if ($currentHash -ne $originalHash) {
-        throw '当前 DLL 不是已验证的原版文件，停止计划。'
+    if ($profile.CurrentState -ne 'Original') {
+        throw "当前 DLL 状态为 $($profile.CurrentState)，不是可部署的原版状态；停止计划。"
     }
     foreach ($offset in $allPatchOffsets) {
         $bytes = Read-BytesAt $DllPath $offset
@@ -140,14 +95,14 @@ if ($Mode -eq 'Plan') {
             throw "补丁位置 0x$('{0:X}' -f $offset) 的原始字节不匹配，停止计划。"
         }
     }
-    Write-Output 'PLAN_OK: 三处位置均为预期原始字节；未修改文件。'
+    Write-Output 'PLAN_OK: 三处位置均已通过自适应校验；未修改文件。'
     return
 }
 
 if ($Mode -eq 'Apply') {
     Assert-TargetStopped $DllPath
-    if ($currentHash -ne $originalHash) {
-        throw '当前 DLL 不是已验证的原版文件，拒绝修改。'
+    if ($profile.CurrentState -ne 'Original') {
+        throw "当前 DLL 状态为 $($profile.CurrentState)，拒绝修改。"
     }
 
     foreach ($offset in $allPatchOffsets) {
@@ -164,7 +119,7 @@ if ($Mode -eq 'Apply') {
     $backupDirectory = Split-Path -Parent $BackupPath
     New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
     Copy-Item -LiteralPath $DllPath -Destination $BackupPath -Force
-    if ((Get-Sha256 $BackupPath) -ne $originalHash) {
+    if ((Get-Sha256 $BackupPath) -ne $currentHash) {
         throw '原版备份哈希不一致，拒绝继续修改。'
     }
 
@@ -176,6 +131,11 @@ if ($Mode -eq 'Apply') {
             throw "写入后校验失败：0x$('{0:X}' -f $offset)。"
         }
     }
+    $afterProfile = Get-PatchProfile $DllPath $currentHash
+    if ($afterProfile.CurrentState -ne 'PrimaryPatched' -or
+        -not (Test-ProfileOffsetsEqual $profile $afterProfile)) {
+        throw '写入后自适应状态校验失败，拒绝报告成功。'
+    }
     $afterHash = Get-Sha256 $DllPath
     Write-Output "APPLIED: $afterHash"
     Write-Output "BACKUP: $BackupPath"
@@ -184,8 +144,8 @@ if ($Mode -eq 'Apply') {
 
 if ($Mode -eq 'ExtendPage') {
     Assert-TargetStopped $DllPath
-    if ($currentHash -ne $primaryPatchedHash) {
-        throw '当前 DLL 不是已验证的前两处补丁状态，拒绝追加页面候选补丁。'
+    if ($profile.CurrentState -ne 'PrimaryPatched') {
+        throw "当前 DLL 状态为 $($profile.CurrentState)，不是前两处补丁状态，拒绝追加页面候选补丁。"
     }
 
     foreach ($offset in $primaryPatchOffsets) {
@@ -212,6 +172,11 @@ if ($Mode -eq 'ExtendPage') {
     if (-not (Test-BytesEqual (Read-BytesAt $DllPath $pagePatchOffset) $patchedBytes)) {
         throw '页面候选补丁写入后校验失败。'
     }
+    $afterProfile = Get-PatchProfile $DllPath $profile.OriginalHash
+    if ($afterProfile.CurrentState -ne 'ExtendedPatched' -or
+        -not (Test-ProfileOffsetsEqual $profile $afterProfile)) {
+        throw '追加后自适应状态校验失败，拒绝报告成功。'
+    }
     $afterHash = Get-Sha256 $DllPath
     Write-Output "EXTENDED: $afterHash"
     Write-Output "PREVIOUS_BACKUP: $BackupPath"
@@ -220,53 +185,54 @@ if ($Mode -eq 'ExtendPage') {
 
 if ($Mode -eq 'RestorePrevious') {
     Assert-TargetStopped $DllPath
+    if ($profile.CurrentState -ne 'ExtendedPatched') {
+        throw "当前 DLL 状态为 $($profile.CurrentState)，不是完整补丁状态，拒绝撤销页面候选。"
+    }
     if ([string]::IsNullOrWhiteSpace($BackupPath)) {
         throw 'RestorePrevious 必须提供 -BackupPath。'
     }
     if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
         throw "找不到追加前备份: $BackupPath"
     }
-    if ((Get-Sha256 $BackupPath) -ne $primaryPatchedHash) {
-        throw '追加前备份哈希不是预期的前两处补丁状态，拒绝恢复。'
-    }
-    foreach ($offset in $primaryPatchOffsets) {
-        if (-not (Test-BytesEqual (Read-BytesAt $DllPath $offset) $patchedBytes)) {
-            throw "当前 DLL 在 0x$('{0:X}' -f $offset) 不是预期的已补丁字节，拒绝覆盖。"
-        }
-    }
-    if (-not (Test-BytesEqual (Read-BytesAt $DllPath $pagePatchOffset) $patchedBytes)) {
-        throw "当前 DLL 在页面候选位置 0x$('{0:X}' -f $pagePatchOffset) 不是追加补丁字节，拒绝覆盖。"
+    $backupProfile = Get-PatchProfile $BackupPath $profile.OriginalHash
+    if ($backupProfile.CurrentState -ne 'PrimaryPatched' -or
+        -not (Test-ProfileOffsetsEqual $profile $backupProfile)) {
+        throw '追加前备份不是同一补丁 profile 的前两处状态，拒绝恢复。'
     }
     Copy-Item -LiteralPath $BackupPath -Destination $DllPath -Force
-    if ((Get-Sha256 $DllPath) -ne $primaryPatchedHash) {
-        throw '撤销页面候选补丁后哈希不一致。'
+    $afterProfile = Get-PatchProfile $DllPath $profile.OriginalHash
+    if ($afterProfile.CurrentState -ne 'PrimaryPatched' -or
+        -not (Test-ProfileOffsetsEqual $profile $afterProfile)) {
+        throw '撤销页面候选补丁后状态不一致。'
     }
     return
 }
 
 if ($Mode -eq 'Restore') {
     Assert-TargetStopped $DllPath
+    if ($profile.CurrentState -ne 'PrimaryPatched' -and $profile.CurrentState -ne 'ExtendedPatched') {
+        throw "当前 DLL 状态为 $($profile.CurrentState)，不是可恢复的补丁状态。"
+    }
     if ([string]::IsNullOrWhiteSpace($BackupPath)) {
         throw 'Restore 必须提供 -BackupPath。'
     }
     if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
         throw "找不到备份: $BackupPath"
     }
-    if ((Get-Sha256 $BackupPath) -ne $originalHash) {
-        throw '备份哈希不是预期的原版哈希，拒绝恢复。'
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedOriginalHash) -and
+        (Get-Sha256 $BackupPath) -ne $ExpectedOriginalHash) {
+        throw '备份哈希与状态记录不一致，拒绝恢复。'
     }
-    foreach ($offset in $primaryPatchOffsets) {
-        if (-not (Test-BytesEqual (Read-BytesAt $DllPath $offset) $patchedBytes)) {
-            throw "当前 DLL 在 0x$('{0:X}' -f $offset) 不是本补丁写入的字节，拒绝覆盖。"
-        }
-    }
-    $pageBytes = Read-BytesAt $DllPath $pagePatchOffset
-    if (-not (Test-BytesEqual $pageBytes $patchedBytes) -and -not (Test-BytesEqual $pageBytes $originalBytes)) {
-        throw "当前 DLL 在页面候选位置 0x$('{0:X}' -f $pagePatchOffset) 不是可识别状态，拒绝覆盖。"
+    $backupProfile = Get-PatchProfile $BackupPath $ExpectedOriginalHash
+    if ($backupProfile.CurrentState -ne 'Original' -or
+        -not (Test-ProfileOffsetsEqual $profile $backupProfile)) {
+        throw '备份不是同一补丁 profile 的原版状态，拒绝恢复。'
     }
     Copy-Item -LiteralPath $BackupPath -Destination $DllPath -Force
-    if ((Get-Sha256 $DllPath) -ne $originalHash) {
-        throw '恢复后哈希不一致。'
+    $afterProfile = Get-PatchProfile $DllPath $ExpectedOriginalHash
+    if ($afterProfile.CurrentState -ne 'Original' -or
+        (Get-Sha256 $DllPath) -ne (Get-Sha256 $BackupPath)) {
+        throw '恢复后自适应状态或哈希不一致。'
     }
     return
 }

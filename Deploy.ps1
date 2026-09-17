@@ -8,25 +8,11 @@ $ErrorActionPreference = 'Stop'
 $localDirectory = Join-Path $PSScriptRoot '.local'
 $statePath = Join-Path $localDirectory 'state.json'
 $patchScript = Join-Path $PSScriptRoot 'tools\PatchAds.ps1'
-$originalHash = '8F7406A8A465E851EE10EAECCCB572D0E5B4E00D480C770938C714C396097B74'
-$primaryPatchedHash = 'E83A63EB167F77BC2A3EDF8F5E0E7669DDFA0603240F0740F04BB27BD48E7789'
-$extendedPatchedHash = '0DD1EAC8610D2A9CF8A14E1F892A806E38A6F008731F056C33AA8147F527E2CC'
-$originalBytes = [byte[]](0x85, 0xF6, 0x0F, 0x95, 0xC0)
-$primaryPatchOffsets = [int64[]](0x5619AEA, 0x561A41A)
-$pagePatchOffset = [int64]0x3C079DA
-$allPatchOffsets = [int64[]]($primaryPatchOffsets + $pagePatchOffset)
-
-function Get-Sha256([string]$Path) {
-    $stream = [System.IO.File]::OpenRead($Path)
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToUpperInvariant()
-    }
-    finally {
-        $sha256.Dispose()
-        $stream.Dispose()
-    }
+$profileScript = Join-Path $PSScriptRoot 'tools\PatchProfile.ps1'
+if (-not (Test-Path -LiteralPath $profileScript -PathType Leaf)) {
+    throw "找不到定位模块: $profileScript"
 }
+. $profileScript
 
 function Read-State {
     if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
@@ -84,43 +70,19 @@ function Find-LatestBackup([string]$Pattern) {
     return $files | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 }
 
-function Test-OriginalBackup([string]$Path) {
-    if ([string]::IsNullOrWhiteSpace($Path) -or
-        -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return $false
-    }
-    try {
-        return ((Get-Sha256 $Path) -eq $originalHash)
-    }
-    catch {
-        return $false
-    }
-}
-
-function Write-BytesAt([string]$Path, [int64]$Offset, [byte[]]$Bytes) {
-    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
-    try {
-        [void]$stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
-        $stream.Write($Bytes, 0, $Bytes.Length)
-        $stream.Flush()
-    }
-    finally {
-        $stream.Dispose()
-    }
-}
-
-function New-RecoveredOriginalBackup([string]$SourcePath, [string]$CurrentHash) {
+function New-RecoveredOriginalBackup([string]$SourcePath, $Profile) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $directory = Join-Path $localDirectory ("backups\recovered-$stamp")
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
     $backupPath = Join-Path $directory 'target.dll.original'
     Copy-Item -LiteralPath $SourcePath -Destination $backupPath -Force
 
-    $offsets = if ($CurrentHash -eq $primaryPatchedHash) { $primaryPatchOffsets } else { $allPatchOffsets }
-    foreach ($offset in $offsets) {
-        Write-BytesAt $backupPath $offset $originalBytes
+    foreach ($offset in $Profile.AllPatchOffsets) {
+        Write-BytesAt $backupPath $offset $script:OriginalPatchBytes
     }
-    if (-not (Test-OriginalBackup $backupPath)) {
+    $recoveredProfile = Get-PatchProfile $backupPath ''
+    if ($recoveredProfile.CurrentState -ne 'Original' -or
+        -not (Test-ProfileOffsetsEqual $Profile $recoveredProfile)) {
         throw '无法从当前已知补丁状态重建原版备份，已停止。'
     }
     return $backupPath
@@ -140,12 +102,14 @@ try {
 
     $state = Read-State
     $targetDll = Resolve-Dll $DllPath $state
-    $currentHash = Get-Sha256 $targetDll
+    $expectedOriginalHash = if ($null -ne $state) { [string]$state.OriginalHash } else { '' }
+    $profile = Get-PatchProfile $targetDll $expectedOriginalHash
+    $currentHash = $profile.CurrentHash
     $originalBackup = $null
     $previousBackup = $null
 
-    if ($currentHash -eq $extendedPatchedHash) {
-        Write-Host '当前状态已经是完整部署状态。'
+    if ($profile.CurrentState -eq 'ExtendedPatched') {
+        Write-Host "当前状态已经是完整部署状态（$($profile.Name)）。"
         if ($null -ne $state) {
             $originalBackup = [string]$state.OriginalBackupPath
             $previousBackup = [string]$state.PreviousBackupPath
@@ -153,15 +117,15 @@ try {
         if ([string]::IsNullOrWhiteSpace($originalBackup)) {
             $originalBackup = Find-LatestBackup '*.original'
         }
-        if (-not (Test-OriginalBackup $originalBackup)) {
-            $originalBackup = New-RecoveredOriginalBackup $targetDll $currentHash
+        if (-not (Test-OriginalBackup $originalBackup $profile $expectedOriginalHash)) {
+            $originalBackup = New-RecoveredOriginalBackup $targetDll $profile
             Write-Host "已从已验证的补丁文件重建原版备份: $originalBackup"
         }
         if ([string]::IsNullOrWhiteSpace($previousBackup)) {
             $previousBackup = Find-LatestBackup '*.previous'
         }
     }
-    elseif ($currentHash -eq $originalHash) {
+    elseif ($profile.CurrentState -eq 'Original') {
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $originalBackup = New-BackupPath 'original' $stamp
         $previousBackup = Join-Path $localDirectory ("backups\page-$stamp\target.dll.previous")
@@ -169,15 +133,15 @@ try {
         & $patchScript -Mode Apply -DllPath $targetDll -BackupPath $originalBackup
         & $patchScript -Mode ExtendPage -DllPath $targetDll -BackupPath $previousBackup
     }
-    elseif ($currentHash -eq $primaryPatchedHash) {
+    elseif ($profile.CurrentState -eq 'PrimaryPatched') {
         if ($null -ne $state) {
             $originalBackup = [string]$state.OriginalBackupPath
         }
-        if (-not (Test-OriginalBackup $originalBackup)) {
+        if (-not (Test-OriginalBackup $originalBackup $profile $expectedOriginalHash)) {
             $originalBackup = Find-LatestBackup '*.original'
         }
-        if (-not (Test-OriginalBackup $originalBackup)) {
-            $originalBackup = New-RecoveredOriginalBackup $targetDll $currentHash
+        if (-not (Test-OriginalBackup $originalBackup $profile $expectedOriginalHash)) {
+            $originalBackup = New-RecoveredOriginalBackup $targetDll $profile
             Write-Host "已从已验证的补丁文件重建原版备份: $originalBackup"
         }
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -185,14 +149,17 @@ try {
         & $patchScript -Mode ExtendPage -DllPath $targetDll -BackupPath $previousBackup
     }
     else {
-        throw "目标文件哈希不在已验证状态列表中: $currentHash"
+        throw "目标文件状态无法安全识别: $currentHash"
     }
 
+    $originalHash = if ([string]::IsNullOrWhiteSpace($originalBackup)) { '' } else { Get-Sha256 $originalBackup }
     Save-State @{
         SchemaVersion = 1
         DllPath = $targetDll
         OriginalBackupPath = $originalBackup
         PreviousBackupPath = $previousBackup
+        OriginalHash = $originalHash
+        PatchProfile = $profile.Name
         LastAction = 'deployed'
     }
     Write-Host '部署完成。请启动客户端并检查目标页面。'

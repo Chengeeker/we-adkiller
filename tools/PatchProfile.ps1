@@ -169,8 +169,8 @@ function New-PatchProfile(
 function Get-AdaptiveProfile([string]$Path, [string]$CurrentHash, [string]$ExpectedOriginalHash) {
     $data = [System.IO.File]::ReadAllBytes($Path)
     $candidateOffsets = Get-AdaptiveCandidateOffsets $data
-    if ($candidateOffsets.Length -ne 10) {
-        throw "自适应签名候选数量为 $($candidateOffsets.Length)，不是预期的 10 个；拒绝修改。"
+    if ($candidateOffsets.Length -lt 10 -or $candidateOffsets.Length -gt 11) {
+        throw "自适应签名候选数量为 $($candidateOffsets.Length)，当前仅支持 10 或 11 个；拒绝修改。"
     }
 
     $expectedClusterGaps = [int64[]](0x310, 0x310, 0x310, 0x320, 0x310, 0x310)
@@ -210,7 +210,7 @@ function Get-AdaptiveProfile([string]$Path, [string]$CurrentHash, [string]$Expec
     $pageOffset = [int64]$candidateOffsets[1]
     $state = Get-PatchState (Read-BytesAt $Path $primaryOffsets[0]) (Read-BytesAt $Path $primaryOffsets[1]) (Read-BytesAt $Path $pageOffset)
     $originalHash = if ($state -eq 'Original') { $CurrentHash } else { $ExpectedOriginalHash }
-    return New-PatchProfile 'Adaptive-structural' $CurrentHash $primaryOffsets $pageOffset $state '10 candidates + 5 anchors + shared call target' $originalHash
+    return New-PatchProfile 'Adaptive-structural' $CurrentHash $primaryOffsets $pageOffset $state "$($candidateOffsets.Length) candidates + 5 anchors + shared call target" $originalHash
 }
 
 function Get-PatchProfile([string]$Path, [string]$ExpectedOriginalHash) {
